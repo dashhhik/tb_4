@@ -401,7 +401,7 @@ Orch -> K: publish DeliveryCompleted(failedOver=true)
 
 ### Вариант 2: Durable workflow engine на Temporal для критичного контура
 
-> **Описание:** Каждое критичное уведомление запускает отдельный durable workflow. Workflow хранит состояние, таймеры и шаги failover внутри Temporal, а activity workers выполняют вызовы push/SMS/email провайдеров.
+> **Описание:** Каждое критичное уведомление запускает отдельный durable workflow. Workflow хранит состояние, таймеры, сигналы от callback-ов и шаги failover внутри Temporal, а activity workers выполняют вызовы push/SMS/email провайдеров.
 
 #### Архитектура
 
@@ -411,8 +411,10 @@ Orch -> K: publish DeliveryCompleted(failedOver=true)
 - `Ingress/Event Bus`: Apache Kafka
 - `Workflow Engine`: Temporal
 - `Workflow Persistence`: PostgreSQL для Temporal metadata
-- `Operational Store`: PostgreSQL для внешнего статуса доставки и идемпотентности API
+- `Operational Store`: PostgreSQL для внешнего статуса доставки, идемпотентности API и outbox
+- `Outbox Relay`: CDC-процесс или фоновый relay для гарантированной публикации committed событий
 - `Cache`: Redis для быстрого доступа к policy и контактам
+- `Receipt / Callback API`: отдельный сервис для app ACK и webhook-ов провайдеров
 - `Activity Workers`: Kotlin workers для push/SMS/email
 - `Observability`: OpenTelemetry, Prometheus, Grafana, Tempo, Loki
 - `Audit / Historical Storage`: ClickHouse + S3
@@ -421,49 +423,70 @@ Orch -> K: publish DeliveryCompleted(failedOver=true)
 
 ```plantuml
 @startuml
-!includeurl https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+!include <C4/C4_Container>
 LAYOUT_LEFT_RIGHT()
+SHOW_LEGEND()
 
 Person(customer, "Клиент банка", "Получает критичные уведомления")
 System_Ext(core, "Core Banking / Product Systems", "Создают события транзакций")
+System_Ext(mobile_app, "Mobile Banking App", "Подтверждает получение push в приложении")
 System_Ext(push_provider, "Push Provider", "FCM/APNs или агрегатор")
 System_Ext(sms_provider, "SMS Provider", "Внешний SMS-шлюз")
 System_Ext(email_provider, "Email Provider", "Почтовый провайдер")
 
 System_Boundary(np, "Notification Platform") {
-  Container(api, "Notification API", "Kotlin/Spring Boot", "Принимает критичные уведомления")
-  Container(pref, "Preference Service", "Kotlin/Spring Boot", "Возвращает канальные правила и контакты")
-  Container(kafka, "Kafka", "Event Bus", "События входа и статусы для внешних потребителей")
-  Container(launcher, "Workflow Launcher", "Kotlin Worker", "Запускает Temporal workflow")
-  Container(temporal, "Temporal Cluster", "Workflow Engine", "Хранит durable workflow, таймеры и retry")
-  ContainerDb(op_db, "Operational DB", "PostgreSQL", "Идемпотентность API и внешний статус доставки")
-  Container(cache, "Policy Cache", "Redis", "Горячий кэш правил")
+  Container(api, "Notification API", "Kotlin / Spring Boot", "Принимает критичные уведомления, проверяет идемпотентность, возвращает 202 Accepted")
+  ContainerDb(op_db, "Operational DB", "PostgreSQL", "delivery records, idempotency keys, attempt journal, outbox")
+  Container(relay, "Outbox Relay", "CDC / background relay", "Гарантированно переносит committed events из DB во внутреннюю шину")
+  Container(kafka, "Kafka", "Event Bus", "accepted/status events для внешних потребителей и запуска workflow")
+  Container(launcher, "Workflow Launcher", "Kotlin Worker", "Идемпотентно запускает workflow по accepted-событию")
+  Container(temporal, "Temporal Cluster", "Workflow Engine", "Durable state, timers, retry, failover, race handling")
+  Container(pref, "Preference Service", "Kotlin / Spring Boot", "Подтверждённые контакты и пользовательские настройки")
+  Container(cache, "Policy Cache", "Redis", "Горячий кэш policy и контактов")
+  Container(callbacks, "Receipt / Callback API", "Kotlin / Spring Boot", "Получает app ACK и provider webhooks")
   Container(push_worker, "Push Worker", "Temporal Activity Worker", "Отправка push")
   Container(sms_worker, "SMS Worker", "Temporal Activity Worker", "Отправка SMS")
   Container(email_worker, "Email Worker", "Temporal Activity Worker", "Отправка email")
-  Container(obs, "Observability Stack", "OTel + Prometheus + Grafana", "Метрики, логи, трейсы")
+  Container(audit, "Audit / Analytics Storage", "ClickHouse + S3", "История доставки, аналитика, архив")
+  Container(obs, "Observability Stack", "OTel + Prometheus + Grafana + Loki/Tempo", "Метрики, логи, трейсы, алерты")
 }
 
 Rel(core, api, "POST /notifications/critical")
-Rel(api, op_db, "Создает внешний delivery record")
-Rel(api, kafka, "Публикует NotificationAccepted")
-Rel(launcher, kafka, "Читает NotificationAccepted")
-Rel(launcher, temporal, "StartWorkflow")
-Rel(temporal, pref, "Читает policy/contacts")
-Rel(temporal, cache, "Читает policy cache")
-Rel(temporal, op_db, "Синхронизирует статус")
-Rel(temporal, push_worker, "Execute activity")
-Rel(temporal, sms_worker, "Execute activity")
-Rel(temporal, email_worker, "Execute activity")
+Rel(api, op_db, "Tx: delivery + idempotency + outbox")
+Rel(relay, op_db, "Reads committed outbox / CDC")
+Rel(relay, kafka, "Publishes NotificationAccepted / status events")
+Rel(launcher, kafka, "Consumes NotificationAccepted")
+Rel(launcher, temporal, "StartWorkflow(workflowId = deliveryId)")
+
+Rel(temporal, cache, "Reads policy/contact cache")
+Rel(temporal, pref, "Fallback on cache miss")
+Rel(temporal, op_db, "CAS updates delivery state + attempt journal")
+
+Rel(temporal, push_worker, "Execute push activity")
+Rel(temporal, sms_worker, "Execute SMS activity")
+Rel(temporal, email_worker, "Execute email activity")
+
 Rel(push_worker, push_provider, "Provider API")
 Rel(sms_worker, sms_provider, "Provider API")
 Rel(email_worker, email_provider, "Provider API")
-Rel(temporal, kafka, "Публикует DeliveryCompleted/FailedOver")
-Rel(api, obs, "Метрики/трейсы")
-Rel(temporal, obs, "Метрики/трейсы")
-Rel(push_worker, obs, "Метрики/трейсы")
-Rel(sms_worker, obs, "Метрики/трейсы")
-Rel(email_worker, obs, "Метрики/трейсы")
+
+Rel(mobile_app, callbacks, "Push ACK / app receipt")
+Rel(push_provider, callbacks, "Provider webhooks")
+Rel(sms_provider, callbacks, "DLR / status webhooks")
+Rel(email_provider, callbacks, "Status webhooks")
+
+Rel(callbacks, temporal, "SignalWorkflow(deliveryId, receipt)")
+
+Rel(temporal, kafka, "Publishes DeliveryCompleted / FailedOver / Exhausted")
+Rel(temporal, audit, "Exports audit trail")
+
+Rel(api, obs, "Metrics / traces")
+Rel(relay, obs, "Metrics / traces")
+Rel(temporal, obs, "Metrics / traces")
+Rel(push_worker, obs, "Metrics / traces")
+Rel(sms_worker, obs, "Metrics / traces")
+Rel(email_worker, obs, "Metrics / traces")
+
 Rel(push_provider, customer, "Push")
 Rel(sms_provider, customer, "SMS")
 Rel(email_provider, customer, "Email")
@@ -474,31 +497,115 @@ Rel(email_provider, customer, "Email")
 
 ```plantuml
 @startuml
+autonumber
+
 actor "Core Banking" as Core
 participant "Notification API" as API
 database "Operational DB" as DB
+participant "Outbox Relay" as Relay
 queue "Kafka" as K
 participant "Workflow Launcher" as L
 participant "Temporal Workflow" as WF
+participant "Policy Cache" as Cache
 participant "Preference Service" as Pref
 participant "Push Activity Worker" as PushW
 participant "Push Provider" as PushP
+actor "Mobile Banking App" as App
+participant "Receipt / Callback API" as CB
 
-Core -> API: createCriticalNotification(idempotencyKey, payload)
-API -> DB: insert delivery record(status=accepted)
-API -> K: publish NotificationAccepted
-API --> Core: 202 Accepted(deliveryId)
+== Приём запроса ==
 
-L -> K: consume NotificationAccepted
-L -> WF: start CriticalNotificationWorkflow(deliveryId)
-WF -> Pref: getChannelPolicy(userId)
-Pref --> WF: primary=push, backup=sms
-WF -> PushW: SendPush(deliveryId)
-PushW -> PushP: provider.send()
-PushP --> PushW: accepted(providerMessageId)
-PushW --> WF: success
-WF -> DB: update delivered(channel=push)
-WF -> K: publish DeliveryCompleted
+Core -> API: POST /notifications/critical\n(idempotencyKey, userId, payload)
+note right of API
+API:
+1. валидирует запрос;
+2. проверяет идемпотентность;
+3. создаёт delivery record;
+4. пишет outbox event в одной транзакции.
+end note
+
+API -> DB: BEGIN
+API -> DB: UPSERT idempotency key
+API -> DB: INSERT delivery(status=accepted)
+API -> DB: INSERT outbox(NotificationAccepted)
+API -> DB: COMMIT
+
+API --> Core: 202 Accepted\n(deliveryId)
+
+== Публикация события в асинхронный контур ==
+
+Relay -> DB: Читает committed outbox events
+Relay -> K: Публикует NotificationAccepted(deliveryId)
+
+note right of Relay
+Outbox нужен, чтобы не потерять уведомление
+между COMMIT в БД и публикацией в брокер.
+end note
+
+== Запуск workflow ==
+
+L -> K: Читает NotificationAccepted
+L -> WF: StartWorkflow(workflowId=deliveryId)
+
+note right of WF
+Workflow становится единственной точкой,
+которая управляет жизненным циклом доставки.
+end note
+
+== Выбор канала ==
+
+WF -> Cache: Получить policy и подтверждённые контакты
+alt cache hit
+    Cache --> WF: primary=push, backup=sms, email
+else cache miss
+    WF -> Pref: Запросить настройки пользователя
+    Pref --> WF: primary=push, backup=sms, email
+    WF -> Cache: Обновить кэш policy
+end
+
+note right of WF
+Для критичных уведомлений push — основной канал,
+если токен валиден и канал подтверждён.
+end note
+
+== Подготовка попытки push ==
+
+WF -> DB: Создать attempt(channel=push,\nstatus=in_progress)
+WF -> DB: Обновить delivery status = sending(primary=push)
+WF -> PushW: Выполнить activity SendPush(deliveryId, payload)
+
+PushW -> PushP: Отправить push в provider API
+PushP --> PushW: provider accepted(providerMessageId)
+PushW --> WF: Push request accepted by provider
+
+note right of WF
+Важно:
+provider accepted != доставка пользователю.
+Для push успех определяется не ответом провайдера,
+а app ACK или другим подтверждённым delivery signal.
+end note
+
+== Ожидание подтверждения от приложения ==
+
+WF -> DB: Сохранить providerMessageId и status=waiting_push_ack
+WF -> WF: Запустить таймер ожидания ACK (например, 5 секунд)
+
+App -> CB: Отправить app ACK(deliveryId)
+CB -> WF: SignalWorkflow(PushAckReceived)
+
+== Завершение доставки ==
+
+critical Только один канал может завершить delivery
+    WF -> DB: CAS update final_status=completed,\nwinning_channel=push
+end
+
+WF -> K: Публикует DeliveryCompleted(channel=push,\nfailedOver=false)
+
+note right of WF
+CAS (compare-and-set) нужен,
+чтобы поздние сигналы от других каналов
+не могли повторно завершить одно и то же уведомление.
+end note
 @enduml
 ```
 
@@ -506,39 +613,154 @@ WF -> K: publish DeliveryCompleted
 
 ```plantuml
 @startuml
+autonumber
+
 actor "Core Banking" as Core
 participant "Notification API" as API
 database "Operational DB" as DB
+participant "Outbox Relay" as Relay
 queue "Kafka" as K
 participant "Workflow Launcher" as L
 participant "Temporal Workflow" as WF
-participant "Preference Service" as Pref
 participant "Push Activity Worker" as PushW
 participant "SMS Activity Worker" as SmsW
 participant "Push Provider" as PushP
 participant "SMS Provider" as SmsP
+participant "Receipt / Callback API" as CB
+actor "Mobile Banking App" as App
 
-Core -> API: createCriticalNotification(idempotencyKey, payload)
-API -> DB: insert delivery record
-API -> K: publish NotificationAccepted
-API --> Core: 202 Accepted
+== Приём и регистрация уведомления ==
 
-L -> K: consume NotificationAccepted
-L -> WF: start workflow
-WF -> Pref: getChannelPolicy(userId)
-Pref --> WF: primary=push, backup=sms
-WF -> PushW: SendPush(deliveryId)
+Core -> API: POST /notifications/critical\n(idempotencyKey, payload)
+API -> DB: Tx: idempotency + delivery + outbox
+API --> Core: 202 Accepted(deliveryId)
+
+Relay -> DB: Читает committed outbox event
+Relay -> K: Публикует NotificationAccepted(deliveryId)
+L -> K: Читает NotificationAccepted
+L -> WF: StartWorkflow(deliveryId)
+
+== Первая попытка: push ==
+
+WF -> DB: Создать attempt(push)
+WF -> DB: Установить status = sending(push)
+WF -> PushW: SendPush(deliveryId, payload)
+
 PushW -> PushP: provider.send()
-PushP --> PushW: timeout / temporary error
-PushW --> WF: failure
+PushP --> PushW: provider accepted(providerMessageId)
+PushW --> WF: Push accepted by provider
 
-WF -> WF: wait/retry policy evaluation
-WF -> SmsW: SendSms(deliveryId)
+WF -> DB: Сохранить providerMessageId,\nstatus=waiting_push_ack
+WF -> WF: Старт таймера ожидания ACK = 5 секунд
+
+note right of WF
+Push не считается успешным,
+пока не пришло подтверждение от клиентского приложения.
+Если ACK не пришёл до дедлайна,
+workflow обязан запустить резервный канал.
+end note
+
+== ACK не пришёл вовремя ==
+
+WF -> WF: Таймер PushAckTimeout истёк
+WF -> DB: Зафиксировать reason=push_ack_timeout
+WF -> DB: Перевести delivery в failed_over_pending
+
+== Failover на SMS ==
+
+WF -> DB: Создать attempt(sms)
+WF -> DB: Установить status = sending(sms)
+WF -> SmsW: SendSms(deliveryId, payload)
+
 SmsW -> SmsP: provider.send()
 SmsP --> SmsW: accepted(providerMessageId)
-SmsW --> WF: success
-WF -> DB: update delivered(channel=sms, failedOver=true)
-WF -> K: publish DeliveryCompleted(failedOver=true)
+SmsW --> WF: SMS accepted by provider
+
+note right of WF
+Для SMS критерий успеха обычно сильнее,
+чем просто provider accepted:
+желательно дождаться DLR = delivered,
+если провайдер поддерживает надёжные delivery receipts.
+end note
+
+SmsP -> CB: DLR(deliveryId, delivered)
+CB -> WF: SignalWorkflow(SmsDelivered)
+
+== Завершение через SMS ==
+
+critical Только один terminal transition разрешён
+    WF -> DB: CAS update final_status=completed,\nwinning_channel=sms,\nfailedOver=true
+end
+
+WF -> K: Публикует DeliveryCompleted(channel=sms,\nfailedOver=true)
+
+== Поздний push ACK ==
+
+App -> CB: Поздний Push ACK(deliveryId)
+CB -> WF: SignalWorkflow(PushAckReceivedLate)
+WF -> WF: Проверяет terminal state
+WF -> WF: Игнорирует поздний ACK как no-op
+
+note right of WF
+Если terminal state уже выбран,
+все поздние сигналы становятся no-op.
+Это защита от дублей и повторного завершения доставки.
+end note
+@enduml
+```
+
+**State Machine Diagram: жизненный цикл доставки**
+
+```plantuml
+@startuml
+hide empty description
+
+[*] --> ACCEPTED
+
+ACCEPTED : API принял запрос
+ACCEPTED --> ROUTING : Запущен workflow
+
+ROUTING : Выбор каналов и policy
+ROUTING --> PUSH_IN_PROGRESS : primary = push
+ROUTING --> SMS_IN_PROGRESS : нет валидного push
+ROUTING --> EMAIL_IN_PROGRESS : нет push и нет sms
+ROUTING --> EXHAUSTED : нет допустимых каналов
+
+PUSH_IN_PROGRESS : Отправка push начата
+PUSH_IN_PROGRESS --> WAITING_PUSH_ACK : provider accepted
+PUSH_IN_PROGRESS --> SMS_IN_PROGRESS : provider reject / timeout
+PUSH_IN_PROGRESS --> EMAIL_IN_PROGRESS : provider reject и нет sms
+
+WAITING_PUSH_ACK : Ожидание app ACK
+WAITING_PUSH_ACK --> COMPLETED_PUSH : ACK пришёл до дедлайна
+WAITING_PUSH_ACK --> SMS_IN_PROGRESS : ACK timeout
+WAITING_PUSH_ACK --> EMAIL_IN_PROGRESS : ACK timeout и нет sms
+
+SMS_IN_PROGRESS : Отправка SMS начата
+SMS_IN_PROGRESS --> COMPLETED_SMS : DLR delivered / success criterion met
+SMS_IN_PROGRESS --> EMAIL_IN_PROGRESS : sms failed и email разрешён
+SMS_IN_PROGRESS --> EXHAUSTED : sms failed и следующего канала нет
+
+EMAIL_IN_PROGRESS : Отправка email начата
+EMAIL_IN_PROGRESS --> COMPLETED_EMAIL : provider success criterion met
+EMAIL_IN_PROGRESS --> EXHAUSTED : email failed
+
+COMPLETED_PUSH : terminal
+COMPLETED_SMS : terminal
+COMPLETED_EMAIL : terminal
+EXHAUSTED : terminal
+
+note right of WAITING_PUSH_ACK
+Push success должен быть определён явно.
+Рекомендуется:
+- provider accepted != delivered
+- app ACK = success criterion
+end note
+
+note bottom of COMPLETED_SMS
+Разрешён только один terminal transition.
+Поздние receipts становятся no-op через CAS / completion fence.
+end note
 @enduml
 ```
 
@@ -568,7 +790,7 @@ WF -> K: publish DeliveryCompleted(failedOver=true)
 
 #### Преимущества
 
-- Durable timers, retry и state recovery поддерживаются платформой, а не самописным кодом.
+- Durable timers, retry, signal handling и state recovery поддерживаются платформой, а не самописным кодом.
 - Проще реализовать и сопровождать сложные ветвления failover и отмену лишних попыток.
 - История workflow облегчает аудит, расследование инцидентов и reasoning о корректности.
 
@@ -576,9 +798,9 @@ WF -> K: publish DeliveryCompleted(failedOver=true)
 
 - Новый технологический стек и дополнительная операционная сложность.
 - Потребуется обучение команды и стандарты разработки deterministic workflow.
-- История workflow быстро растёт и требует отдельной политики retention.
+- История workflow и связанные callback/event записи быстро растут и требуют отдельной политики retention и архивирования.
 
----
+----
 
 ## Сравнительный анализ
 
